@@ -205,50 +205,21 @@ def create_coco_dataset(image_set, coco_path, mutiscale, expanded_scales, resolu
         dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, resolution, multi_scale=mutiscale, expanded_scales=expanded_scales))
     return dataset
 
-
-def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
-    # TODO make this more general
-    if tensor_list[0].ndim == 3:
-        if torchvision._is_tracing():
-            # nested_tensor_from_tensor_list() does not export well to ONNX
-            # call _onnx_nested_tensor_from_tensor_list() instead
-            return _onnx_nested_tensor_from_tensor_list(tensor_list)
-
-        # TODO make it support different-sized images
-        max_size = _max_by_axis([list(img.shape) for img in tensor_list])
-        # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
-        batch_shape = [len(tensor_list)] + max_size
-        b, c, h, w = batch_shape
-        dtype = tensor_list[0].dtype
-        device = tensor_list[0].device
-        tensor = torch.zeros(batch_shape, dtype=dtype, device=device)
-        mask = torch.ones((b, h, w), dtype=torch.bool, device=device)
-        for img, pad_img, m in zip(tensor_list, tensor, mask):
-            pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
-            m[: img.shape[1], :img.shape[2]] = False
-    else:
-        raise ValueError('not supported')
-    return NestedTensor(tensor, mask)
-
-def collate_fn(batch):
-    batch = list(zip(*batch))
-    batch[0] = nested_tensor_from_tensor_list(batch[0])
-    return tuple(batch)
-
-
+    
+from util import collate_fn
 
 def create_coco_dataloaders():
     # Create the dataloaders for the COCO dataset
     coco_path = Path('data/coco2017')
-    train_dataset = create_coco_dataset('train', coco_path, mutiscale=False, expanded_scales=False, resolution=640)
-    val_dataset = create_coco_dataset('val', coco_path, mutiscale=False, expanded_scales=False, resolution=640)
+    train_dataset = create_coco_dataset('train', coco_path, mutiscale=False, expanded_scales=False, resolution=224, square_resize_div_64=True)
+    val_dataset = create_coco_dataset('val', coco_path, mutiscale=False, expanded_scales=False, resolution=224, square_resize_div_64=True)
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=2,
         shuffle=True,
         num_workers=4,
-        collate_fn=train_dataset.collate_fn,
+        collate_fn=collate_fn,
     )
 
     val_loader = torch.utils.data.DataLoader(
@@ -256,7 +227,7 @@ def create_coco_dataloaders():
         batch_size=2,
         shuffle=False,
         num_workers=4,
-        collate_fn=val_dataset.collate_fn,
+        collate_fn=collate_fn,
     )
 
     return train_loader, val_loader
