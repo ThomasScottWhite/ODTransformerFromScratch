@@ -208,7 +208,7 @@ def create_coco_dataset(image_set, coco_path, mutiscale, expanded_scales, resolu
     
 from util import collate_fn
 
-def create_coco_dataloaders():
+def create_coco_dataloaders(batch_size=2):
     # Create the dataloaders for the COCO dataset
     coco_path = Path('data/coco2017')
     train_dataset = create_coco_dataset('train', coco_path, mutiscale=False, expanded_scales=False, resolution=224, square_resize_div_64=True)
@@ -216,7 +216,7 @@ def create_coco_dataloaders():
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
-        batch_size=2,
+        batch_size=batch_size,
         shuffle=True,
         num_workers=4,
         collate_fn=collate_fn,
@@ -224,7 +224,7 @@ def create_coco_dataloaders():
 
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
-        batch_size=2,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=4,
         collate_fn=collate_fn,

@@ -14,6 +14,46 @@ import torch
 import torchvision.ops as ops
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 
+import math
+import torch
+
+
+def build_2d_sincos_position_embedding(H, W, dim, temperature=10000.0):
+    """
+    Build 2D sine-cosine positional embeddings like in DETR.
+
+    Args:
+        H, W: height and width of feature map
+        dim: total embedding dimension (must be divisible by 4)
+    Returns:
+        Tensor of shape [H * W, dim]
+    """
+    if dim % 4 != 0:
+        raise ValueError("dim must be divisible by 4")
+
+    # Each position gets dim // 2 (split across X and Y)
+    dim_each = dim // 2
+    dim_x = dim_y = dim_each // 2  # Half for x, half for y
+
+    y_embed = torch.linspace(0, 1, steps=H)
+    x_embed = torch.linspace(0, 1, steps=W)
+    grid_y, grid_x = torch.meshgrid(y_embed, x_embed, indexing="ij")
+
+    # [H, W] → [H, W, dim/4]
+    omega_x = 1.0 / (temperature ** (torch.arange(dim_x, dtype=torch.float32) / dim_x))
+    omega_y = 1.0 / (temperature ** (torch.arange(dim_y, dtype=torch.float32) / dim_y))
+
+    pos_x = grid_x[..., None] * omega_x  # [H, W, dim/4]
+    pos_y = grid_y[..., None] * omega_y  # [H, W, dim/4]
+
+    pos_x = torch.cat([torch.sin(pos_x), torch.cos(pos_x)], dim=-1)  # [H, W, dim/2]
+    pos_y = torch.cat([torch.sin(pos_y), torch.cos(pos_y)], dim=-1)  # [H, W, dim/2]
+
+    pos = torch.cat([pos_y, pos_x], dim=-1)  # [H, W, dim]
+    pos = pos.view(H * W, dim)  # [H*W, dim]
+
+    return pos
+
 
 class LoRALayer(nn.Module):
     """
@@ -118,25 +158,52 @@ class GatingNetwork(nn.Module):
         self.fc = nn.Linear(input_dim, num_experts)
 
     def forward(self, x):
-        return torch.softmax(self.fc(x), dim=1)
+        return torch.softmax(self.fc(x), dim=-1)
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 class DetectionHead(nn.Module):
     """
-    Simple object detection head for bounding boxes and classification.
+    A more expressive object detection head with MLPs for classification and bounding box regression.
     """
 
-    def __init__(self, input_dim, num_classes):
+    def __init__(self, input_dim, num_classes, hidden_dim=256):
         super().__init__()
-        self.cls_head = nn.Linear(input_dim, num_classes)  # Class predictions
-        self.box_head = nn.Linear(input_dim, 4)  # Bounding box predictions
-        self.obj_head = nn.Linear(input_dim, 1)  # Object confidence
+
+        # Classification head: 2-layer MLP + LayerNorm
+        self.cls_head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, num_classes + 1),  # +1 for background
+        )
+
+        # Box regression head: 3-layer MLP + LayerNorm
+        self.box_head = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 4),
+            nn.Sigmoid(),  # Normalize to [0, 1]
+        )
 
     def forward(self, x):
-        class_logits = self.cls_head(x)  # (B, Seq, num_classes)
-        box_preds = self.box_head(x).sigmoid()  # (B, Seq, 4)
-        obj_scores = self.obj_head(x)  # (B, Seq, 1) -> Confidence
-        return class_logits, box_preds, obj_scores
+        """
+        Args:
+            x: [B, Seq, input_dim]
+        Returns:
+            class_logits: [B, Seq, num_classes + 1]
+            box_preds: [B, Seq, 4]
+        """
+        class_logits = self.cls_head(x)
+        box_preds = self.box_head(x)
+        return class_logits, box_preds
 
 
 class MINDObjectDetector(nn.Module):
@@ -207,12 +274,16 @@ class MINDObjectDetector(nn.Module):
         self.backbone = create_model(
             "swin_base_patch4_window7_224", pretrained=True, features_only=True
         )
-        self.projection_C2 = nn.Linear(128, 768)
-        self.projection_C3 = nn.Linear(256, 768)
-        self.projection_C4 = nn.Linear(512, 768)
-        self.projection_C5 = nn.Linear(1024, 768)
 
-        # Freeze pretrained backbone
+        dims = [f["num_chs"] for f in self.backbone.feature_info]
+        print("Feature map dimensions:", dims)
+        self.projection_C2 = nn.Linear(dims[0], 768)
+        self.projection_C3 = nn.Linear(dims[1], 768)
+        self.projection_C4 = nn.Linear(dims[2], 768)
+        self.projection_C5 = nn.Linear(dims[3], 768)
+
+        self.level_embed = nn.Parameter(torch.zeros(4, 1, 768))
+
         for param in self.backbone.parameters():
             param.requires_grad = False
 
@@ -220,102 +291,76 @@ class MINDObjectDetector(nn.Module):
             input_dim=768, num_classes=self.num_categories
         )
 
-    # def forward(self, x):
-    #     C2, C3, C4, C5 = self.backbone(x)
-
-    #     C2_flat = self.flatten_features(C2)
-    #     C3_flat = self.flatten_features(C3)
-    #     C4_flat = self.flatten_features(C4)
-    #     C5_flat = self.flatten_features(C5)
-
-    #     C2_proj = self.projection_C2(C2_flat)
-    #     C3_proj = self.projection_C3(C3_flat)
-    #     C4_proj = self.projection_C4(C4_flat)
-    #     C5_proj = self.projection_C5(C5_flat)
-
-    #     moe_input = torch.cat([C2_proj, C3_proj, C4_proj, C5_proj], dim=1)
-
-    #     if self.adaptable_moe:
-    #         self.expand_experts()
-
-    #     gating_scores = self.gating_network(moe_input)
-    #     moe_output = self.moe_adapters(moe_input, gating_scores)
-
-    #     class_logits, box_preds, obj_scores = self.detection_head(moe_output)
-
-    #     img_h, img_w = 224, 224
-    #     scale = torch.tensor([img_w, img_h, img_w, img_h], device=box_preds.device)
-    #     box_preds = box_preds * scale
-
-    #     return class_logits, box_preds, obj_scores
-
-    # Idk maybe this is better
     def forward(self, x):
-        _, _, C4, _ = self.backbone(x)
+        """
+        Multi‑scale forward pass
+        ------------------------
+        1. Backbone → {C2,C3,C4,C5}
+        2. Flatten + project each scale to a common embed_dim
+        3. Add 2‑D sin‑cos positional encodings  +  a learnable level‑embedding
+        4. Concatenate all tokens     →  [B, ΣHW, embed_dim]
+        5. MoE routing + detection head
+        """
+        B = x.size(0)
 
-        C4_flat = self.flatten_features(C4)
-        C4_proj = self.projection_C4(C4_flat)
+        C2, C3, C4, C5 = self.backbone(x)
 
-        moe_input = C4_proj
+        total_tokens = 100
+        num_levels = 4
+        tokens_per_level = total_tokens // num_levels  # e.g. 25 per level
 
+        # Adjust to your feature maps
+        feature_maps = [C2, C3, C4, C5]
+        projections = [
+            self.projection_C2,
+            self.projection_C3,
+            self.projection_C4,
+            self.projection_C5,
+        ]
+
+        tokens_per_level_list = []
+
+        for lvl, (feat_map, proj, lvl_embed) in enumerate(zip(feature_maps, projections, self.level_embed)):
+            # Convert [B, H, W, C] → [B, C, H, W] if needed
+            if feat_map.shape[-1] == proj.in_features:
+                feat_map = feat_map.permute(0, 3, 1, 2)  # NHWC → NCHW
+
+            B, C, H, W = feat_map.shape
+
+            # Downsample to fixed grid (e.g., 5x5 = 25 tokens per level)
+            target_h = target_w = int(tokens_per_level ** 0.5)
+            pooled = F.adaptive_avg_pool2d(feat_map, output_size=(target_h, target_w))  # [B, C, h, w]
+
+            # Flatten spatial and permute to [B, HW, C]
+            pooled = pooled.flatten(2).permute(0, 2, 1)  # [B, tokens, C]
+
+            # Project to embed dim
+            tokens = proj(pooled)  # [B, tokens, D]
+
+            # Positional encoding for each grid
+            pos = build_2d_sincos_position_embedding(target_h, target_w, tokens.size(-1)).to(tokens.device)
+            pos = pos.unsqueeze(0).expand(B, -1, -1)
+
+            tokens = tokens + pos + lvl_embed  # Add positional + level encoding
+
+            tokens_per_level_list.append(tokens)
+
+        # Final compressed multiscale token sequence: [B, ~100, D]
+        moe_input = torch.cat(tokens_per_level_list, dim=1)
+
+        # 5️⃣ Routing through Mixture-of-Experts (with optional dynamic expert growth)
         if self.adaptable_moe:
             self.expand_experts()
 
-        gating_scores = self.gating_network(moe_input)
-        moe_output = self.moe_adapters(moe_input, gating_scores)
+        gating_scores = self.gating_network(moe_input)  # [B, ΣHW, E]
+        moe_output = self.moe_adapters(moe_input, gating_scores)  # [B, ΣHW, D]
 
-        class_logits, box_preds, obj_scores = self.detection_head(moe_output)
-
-        # Convert boxes from absolute xyxy to normalized cxcywh
-        def xyxy_to_cxcywh(boxes):
-            x1, y1, x2, y2 = boxes.unbind(-1)
-            cx = (x1 + x2) / 2
-            cy = (y1 + y2) / 2
-            w = x2 - x1
-            h = y2 - y1
-            return torch.stack((cx, cy, w, h), dim=-1)
-
-        # Assuming input images are always 224x224
-        img_h, img_w = 640, 224
-        scale = torch.tensor([img_w, img_h, img_w, img_h], device=box_preds.device)
-
-        box_preds = xyxy_to_cxcywh(box_preds)  # Convert format
-        box_preds = box_preds / scale          # Normalize to [0, 1]
-
+        # Final detection head
+        class_logits, box_preds = self.detection_head(moe_output)
         return {
-            "pred_logits": class_logits,
-            "pred_boxes": box_preds,
-            "pred_obj": obj_scores,
+            "pred_logits": class_logits,  # [B, ΣHW, num_classes + 1]
+            "pred_boxes": box_preds,  # [B, ΣHW, 4]
         }
-
-    def apply_nms_per_image(self, class_logits, boxes, obj_scores, conf_mask):
-        iou_threshold = 0.5
-        batch_size = class_logits.shape[0]
-
-        final_boxes, final_scores, final_labels = [], [], []
-
-        for batch_idx in range(batch_size):
-            valid_boxes = boxes[batch_idx][conf_mask[batch_idx]]
-            valid_scores = obj_scores[batch_idx][conf_mask[batch_idx]]
-            valid_class_logits = class_logits[batch_idx][conf_mask[batch_idx]]
-
-            if valid_boxes.numel() == 0:
-                final_boxes.append([])
-                final_scores.append([])
-                final_labels.append([])
-                continue
-
-            class_probs = valid_class_logits.softmax(dim=-1)
-            class_scores, class_labels = class_probs.max(dim=-1)
-
-            final_scores_for_nms = valid_scores * class_scores
-            keep_indices = ops.nms(valid_boxes, final_scores_for_nms, iou_threshold)
-
-            final_boxes.append(valid_boxes[keep_indices])
-            final_scores.append(final_scores_for_nms[keep_indices])
-            final_labels.append(class_labels[keep_indices])
-
-        return final_boxes, final_scores, final_labels
 
     def expand_experts(self):
         """
@@ -323,19 +368,26 @@ class MINDObjectDetector(nn.Module):
         """
         if not self.adaptable_moe:
             return
+
         current_categories = self.art_module.get_current_categories()
+
         if current_categories > self.current_expert_count:
             new_experts_needed = current_categories - self.current_expert_count + 1
+
             self.moe_adapters.add_experts(
                 num_new_experts=new_experts_needed,
                 input_dim=self.feature_dim,
                 output_dim=self.feature_dim,
                 rank=self.rank,
             )
-            self.gating_network.fc = nn.Linear(
-                self.feature_dim, current_categories + 1
-            ).to(self.gating_network.fc.weight.device)
-            self.current_expert_count = current_categories + 1
+
+            # Sync gating network to new adapter count
+            new_total = len(self.moe_adapters.adapters)
+            self.gating_network.fc = nn.Linear(self.feature_dim, new_total).to(
+                self.gating_network.fc.weight.device
+            )
+
+            self.current_expert_count = new_total
 
     def flatten_features(self, features):
         B, H, W, D = features.shape

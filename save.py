@@ -7,10 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.ops import generalized_box_iou, box_iou
 from scipy.optimize import linear_sum_assignment
-from tqdm import tqdm
-from torch.amp import autocast, GradScaler
-from torch.optim.lr_scheduler import CosineAnnealingLR
-import os
 
 
 class SimpleMatcher:
@@ -38,92 +34,8 @@ class SimpleMatcher:
 
 
 import torch
-from scipy.optimize import linear_sum_assignment
-from torchvision.ops import box_iou
-
-
-class HungarianMatcher:
-    """
-    Almost‑drop‑in replacement for SimpleMatcher.
-    λ_class, λ_bbox, λ_giou follow DETR (1, 5, 2) by default.
-    """
-
-    def __init__(self, lambda_cls=1.0, lambda_bbox=5.0, lambda_giou=2.0):
-        self.lambda_cls = lambda_cls
-        self.lambda_bbox = lambda_bbox
-        self.lambda_giou = lambda_giou
-
-    @torch.no_grad()
-    def __call__(self, pred_logits, pred_boxes, targets):
-        bs, num_queries, _ = pred_logits.shape
-        device = pred_logits.device
-
-        indices = []
-        for b in range(bs):
-            tgt_boxes = targets[b]["boxes"]
-            tgt_labels = targets[b]["labels"]
-
-            if tgt_boxes.numel() == 0:
-                # no objects in this image ➜ everything stays background
-                indices.append(
-                    (torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long))
-                )
-                continue
-
-            # ----- classification cost  ------------------------------------
-            out_prob = pred_logits[b].softmax(-1)  # (Q, C+1)
-            cost_cls = -out_prob[:, tgt_labels].log()  # (Q, T)
-
-            # ----- bbox & GIoU costs ---------------------------------------
-            out_bbox = pred_boxes[b]  # (Q, 4)
-            cost_bbox = torch.cdist(out_bbox, tgt_boxes, p=1)  # (Q, T)
-
-            # convert to xyxy for IoU
-            def cxcywh_to_xyxy(box):
-                cx, cy, w, h = box.unbind(-1)
-                return torch.stack(
-                    [cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h], dim=-1
-                )
-
-            giou = box_iou(cxcywh_to_xyxy(out_bbox), cxcywh_to_xyxy(tgt_boxes))[
-                0
-            ]  # (Q, T)
-            cost_giou = 1.0 - giou
-
-            # ----- final cost matrix ---------------------------------------
-            C = (
-                self.lambda_cls * cost_cls
-                + self.lambda_bbox * cost_bbox
-                + self.lambda_giou * cost_giou
-            )
-            C = C.cpu()
-
-            q_idx, t_idx = linear_sum_assignment(C)
-            indices.append(
-                (
-                    torch.as_tensor(q_idx, dtype=torch.int64, device=device),
-                    torch.as_tensor(t_idx, dtype=torch.int64, device=device),
-                )
-            )
-
-        return indices
-
-
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-def focal_loss(inputs, targets, alpha=0.25, gamma=2.0):
-    p = F.softmax(inputs, -1)
-    ce = F.cross_entropy(inputs, targets, reduction="none")
-    pt = p[torch.arange(len(targets), device=inputs.device), targets]
-
-    alpha_factor = torch.full_like(pt, 1 - alpha)
-    alpha_factor[targets == inputs.shape[-1] - 1] = alpha
-
-    loss = alpha_factor * (1 - pt) ** gamma * ce
-    return loss.mean()
 
 
 def box_cxcywh_to_xyxy(x):
@@ -187,8 +99,6 @@ class DETRLoss(nn.Module):
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
-        self.register_buffer("ce_weight", torch.tensor([1] * num_classes + [0.1]))
-
         # DETR typically computes four main losses:
         #   1) classification loss (cross-entropy)
         #   2) bounding box L1 loss
@@ -253,17 +163,7 @@ class DETRLoss(nn.Module):
         # --------------------------
         # 1) Classification loss
         # --------------------------
-        # loss_ce = F.cross_entropy(out_logits, tgt_labels)
-        print("out_logits", out_logits)
-        print("tgt_labels", tgt_labels)
-        print("out_logits.shape", out_logits.shape)
-        print("tgt_labels.shape", tgt_labels.shape)
-
-        probs = out_logits.softmax(-1)
-        print("avg background prob:", probs[:, -1].mean().item())
-        print("max foreground prob:", probs[:, :-1].max(dim=1).values.max().item())
-        
-        loss_ce = focal_loss(out_logits, tgt_labels, alpha=0.5, gamma=2)
+        loss_ce = F.cross_entropy(out_logits, tgt_labels)
 
         # --------------------------
         # 2) BBox L1 loss (matched only)
@@ -317,7 +217,7 @@ class DETRLoss(nn.Module):
         return total_loss, loss_dict
 
 
-train_loader, test_loader = create_coco_dataloaders(batch_size=16)
+train_loader, test_loader = create_coco_dataloaders()
 
 model = MINDObjectDetector(
     input_size=224,
@@ -338,130 +238,80 @@ print(f"Using device: {device}")
 model = model.to(device)
 criterion = DETRLoss(
     num_classes=91,
-    matcher=HungarianMatcher(),
+    matcher=SimpleMatcher(),
     weight_dict={
-        "loss_ce": 3,
-        "loss_bbox": 5,
+        "loss_ce": 1.0,
+        "loss_bbox": 5.0,
         "loss_giou": 2.0,
-        "loss_cardinality": 0.5,
+        "loss_cardinlaity": 1.0,
     },
 ).to(device)
 
+from tqdm import tqdm
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast, GradScaler
 
-start_epoch = 0
-model_path = "checkpoint.pth"
-
-# Setup
 optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-scheduler = CosineAnnealingLR(optimizer, T_max=150, eta_min=1e-6)
+scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=1e-6)
 scaler = GradScaler()
 
-# Try loading checkpoint
-if os.path.exists(model_path):
-    try:
-        checkpoint = torch.load(model_path, map_location=device)
-        model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
-        scheduler.load_state_dict(checkpoint["scheduler"])
-        scaler.load_state_dict(checkpoint["scaler"])
-        start_epoch = checkpoint["epoch"] + 1
-        print(f"Resumed training from epoch {start_epoch}")
-    except Exception as e:
-        print(f"Failed to load checkpoint: {e}")
-        exit(1)
-else:
-    print("Starting training from scratch.")
+save_list = []
 
-for epoch in range(start_epoch, 500):
-    total_loss = 0.0
-    total_loss_ce = 0.0
-    total_loss_bbox = 0.0
-    total_loss_giou = 0.0
-    total_loss_card = 0.0
+for epoch in range(50):
+    total_loss = 0
     model.train()
-
     train_loop = tqdm(train_loader, desc=f"[Epoch {epoch+1}] Training", leave=False)
 
     for images, targets in train_loop:
         tensors, masks = images.decompose()
         tensors = tensors.to(device)
         masks = masks.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+        for tgt in targets:
+            tgt["boxes"] = tgt["boxes"].to(device)
+            tgt["labels"] = tgt["labels"].to(device)
+            tgt["size"] = tgt["size"].to(device)
 
         optimizer.zero_grad()
 
-        with autocast(device_type="cuda", dtype=torch.bfloat16):
+        with autocast('cuda'):
             outputs = model(tensors)
-            try:
-                loss, loss_dict = criterion(outputs, targets)
-            except Exception as e:
-                print(outputs)
-                print(targets)
-                print(e)
-                exit(1)
+
+            if torch.isnan(outputs["pred_logits"]).any() or torch.isnan(outputs["pred_boxes"]).any():
+                print("NaN in model outputs")
+                continue
+
+            loss, loss_dict = criterion(outputs, targets)
 
         if not torch.isfinite(loss):
             print("Non-finite loss, skipping")
             continue
 
         scaler.scale(loss).backward()
+
+        # Gradient clipping
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         scaler.step(optimizer)
         scaler.update()
 
-        # Accumulate loss values
         total_loss += loss.item()
-        total_loss_ce += loss_dict["loss_ce"].item()
-        total_loss_bbox += loss_dict["loss_bbox"].item()
-        total_loss_giou += loss_dict["loss_giou"].item()
-        total_loss_card += loss_dict["loss_cardinality"].item()
+        train_loop.set_postfix(loss=loss.item())
 
-        # Update progress bar
-        train_loop.set_postfix(
-            loss=loss.item(),
-            loss_ce=loss_dict["loss_ce"].item(),
-            loss_bbox=loss_dict["loss_bbox"].item(),
-            loss_giou=loss_dict["loss_giou"].item(),
-            loss_cardinality=loss_dict["loss_cardinality"].item(),
-        )
+    avg_loss = total_loss / len(train_loader)
+    scheduler.step()  # Step LR schedule
 
-    num_batches = len(train_loader)
-    avg_loss = total_loss / num_batches
-    avg_loss_ce = total_loss_ce / num_batches
-    avg_loss_bbox = total_loss_bbox / num_batches
-    avg_loss_giou = total_loss_giou / num_batches
-    avg_loss_card = total_loss_card / num_batches
-
-    scheduler.step()
-
-    # Save losses and checkpoint
     with open("losses.txt", "a") as f:
-        f.write(
-            f"Epoch: {epoch} "
-            f"Loss: {avg_loss:.4f} "
-            f"CE: {avg_loss_ce:.4f} "
-            f"BBox: {avg_loss_bbox:.4f} "
-            f"GIoU: {avg_loss_giou:.4f} "
-            f"Card: {avg_loss_card:.4f}\n"
-        )
+        f.write(f"Epoch: {epoch} Loss:{avg_loss:.4f}\n")
 
-    torch.save(
-        {
-            "epoch": epoch,
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
-            "scaler": scaler.state_dict(),
-        },
-        model_path,
-    )
+    checkpoint = {
+    'epoch': epoch + 1,  # Next epoch to resume from
+    'model_state_dict': model.state_dict(),
+    'optimizer_state_dict': optimizer.state_dict(),
+    'scheduler_state_dict': scheduler.state_dict(),
+    'scaler_state_dict': scaler.state_dict(),  # only if using AMP
+}
+    torch.save(checkpoint, "checkpoint.pth")
 
-    print(
-        f"Epoch {epoch+1}, "
-        f"Avg Loss: {avg_loss:.4f}, "
-        f"CE: {avg_loss_ce:.4f}, "
-        f"BBox: {avg_loss_bbox:.4f}, "
-        f"GIoU: {avg_loss_giou:.4f}, "
-        f"Card: {avg_loss_card:.4f}"
-    )
+    print(f"Epoch {epoch+1}, Average Loss: {avg_loss:.4f}")
